@@ -1,0 +1,1529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Risk Score Formula Optimizer</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Import Map for React, Lucide, and Firebase -->
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "lucide-react": "https://esm.sh/lucide-react@0.263.1",
+            "firebase/app": "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js",
+            "firebase/auth": "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js",
+            "firebase/firestore": "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js"
+        }
+    }
+    </script>
+
+    <!-- Babel for JSX and TypeScript transformation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        /* Custom scrollbar for better aesthetics */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8; 
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module" data-presets="typescript,react">
+        import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
+        import { createRoot } from "react-dom/client";
+        import { Eye, EyeOff, Sliders, Hash, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Calculator, FileText, BarChart3, TrendingUp, TrendingDown, Clock, Lightbulb, Plus, Minus, Wrench, ArrowUpDown, Download } from 'lucide-react';
+        
+        // Firebase Imports
+        import { initializeApp } from 'firebase/app';
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+        import { getFirestore } from 'firebase/firestore';
+
+        // ----- Constants -----
+        const DEFAULT_COMBINATIONS_THRESHOLD = 2000000; 
+        const DEFAULT_TABLE_DISPLAY_LIMIT = 2000; 
+        const PAGE_SIZE = 100;
+        const STEP_FINE = 0.01;
+        const ACCELERATION_DELAY_MS = 250; 
+        const DOUBLE_CLICK_DELAY = 300; 
+
+        // ----- Types -----
+        type Combination = Record<string, string | number> & { id: number; Score?: number };
+        type CategoryInfo = {
+          id: string;
+          label: string;
+          value: number | null; 
+          factors: string[]; 
+        };
+        type FactorValue = string;
+        type Factor = string;
+        type Weights = Record<string, number>; 
+        type ScoreFilter = { min: number; max: number; label: string } | null;
+
+        // ----- Utility Functions -----
+
+        const prettifyLabel = (id: string): string =>
+          id
+            .replace(/[-_]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+
+        const getWeightKey = (factor: Factor, value: FactorValue) => `${factor}:${value}`;
+
+        const clampScore = (value: number) => Math.max(0, Math.min(100, value));
+
+        // Calculate total combinations count (Math only)
+        const calculateTotalCombinations = (factors: Record<Factor, FactorValue[]>): number => {
+            let count = 1;
+            for (const factor in factors) {
+                const factorLength = factors[factor].length;
+                if (factorLength > 0) {
+                    if (count > Number.MAX_SAFE_INTEGER / factorLength) {
+                        return Number.MAX_SAFE_INTEGER; 
+                    }
+                    count *= factorLength;
+                }
+            }
+            return count;
+        };
+
+        /**
+         * Checks factors and adds "N/A" (0) if no explicit default is found, excluding "Severity".
+         */
+        const addNAIfNoDefault = (
+            factors: Record<Factor, FactorValue[]>, 
+            weights: Weights,
+            defaultFlags: Record<string, boolean>
+        ): { factors: Record<Factor, FactorValue[]>, weights: Weights } => {
+            const newFactors: Record<Factor, FactorValue[]> = { ...factors };
+            const newWeights: Weights = { ...weights };
+
+            for (const factor in factors) {
+                const values = factors[factor];
+                
+                // 1. Exclusion: Skip the Severity factor
+                if (factor === "Severity") {
+                    continue;
+                }
+
+                if (values.includes("N/A")) {
+                     // Skip if N/A is already present
+                     continue;
+                }
+
+                // 2. Definition of Default: Check if any existing value is explicitly flagged as default (is_default: true).
+                const hasExplicitDefault = values.some(value => {
+                    const key = getWeightKey(factor, value);
+                    return defaultFlags[key]; 
+                });
+
+                // If no explicit default state is found
+                if (!hasExplicitDefault) {
+                    newFactors[factor] = [...values, "N/A"];
+                    const naKey = getWeightKey(factor, "N/A");
+                    
+                    // Set default weight for "N/A" to 0
+                    if (typeof newWeights[naKey] === 'undefined') {
+                        newWeights[naKey] = 0;
+                    }
+                }
+            }
+            return { factors: newFactors, weights: newWeights };
+        }
+
+        /**
+         * OPTIMIZED CORE: Memory-Efficient Combination Processor
+         * Uses DFS to compute stats on-the-fly without storing massive arrays.
+         */
+        const processCombinationsEfficiently = (
+            factors: Record<Factor, FactorValue[]>,
+            categories: CategoryInfo[],
+            weights: Weights,
+            rowsLimit: number,
+            scoreFilter: ScoreFilter
+        ) => {
+            const factorKeys = Object.keys(factors).sort();
+            
+            // Pre-process weights for O(1) lookup
+            const weightMap = new Map<string, Map<string, number>>();
+            factorKeys.forEach(f => {
+                const map = new Map<string, number>();
+                factors[f].forEach(v => {
+                    map.set(v, weights[`${f}:${v}`] ?? 0);
+                });
+                weightMap.set(f, map);
+            });
+
+            // Pre-process Category groupings
+            type NormGroup = { norm: number, factors: Set<string> };
+            const normGroups: NormGroup[] = [];
+            
+            const catMap = new Map<number, Set<string>>();
+            categories.forEach(c => {
+                const n = c.value ?? 0;
+                if (n <= 0) return;
+                if (!catMap.has(n)) catMap.set(n, new Set());
+                c.factors.forEach(f => catMap.get(n)!.add(f));
+            });
+            catMap.forEach((fs, n) => normGroups.push({ norm: n, factors: fs }));
+
+            // Accumulators
+            let min = 100;
+            let max = 0;
+            let sum = 0;
+            let count = 0;
+            const histogramBins = new Array(10).fill(0);
+            const rows: Combination[] = [];
+
+            const currentSelection: Record<string, string> = {};
+
+            const dfs = (depth: number) => {
+                if (depth === factorKeys.length) {
+                    // Leaf Node: Calculate Score
+                    let totalScore = 0;
+
+                    for (const group of normGroups) {
+                        let product = 1;
+                        let hasFactors = false;
+
+                        for (const f of group.factors) {
+                            const val = currentSelection[f];
+                            if (val) {
+                                const w = weightMap.get(f)?.get(val) ?? 0;
+                                const wFrac = w / 100;
+                                if (wFrac !== 0) {
+                                    product *= (1 - wFrac);
+                                    hasFactors = true;
+                                }
+                            }
+                        }
+
+                        if (hasFactors) {
+                            const combined = 1 - product;
+                            totalScore += group.norm * combined;
+                        }
+                    }
+
+                    const finalScore = Math.round(Math.max(0, Math.min(100, totalScore)) * 100) / 100;
+
+                    // Update Stats (Always for the full set, ignoring visual filter for accuracy of "Potential")
+                    if (finalScore < min) min = finalScore;
+                    if (finalScore > max) max = finalScore;
+                    sum += finalScore;
+                    count++;
+
+                    // Update Histogram
+                    let bin = Math.floor(finalScore / 10);
+                    if (bin >= 10) bin = 9; // Handle 100
+                    histogramBins[bin]++;
+
+                    // Update Rows (Only if matches score filter)
+                    // Filter Logic: Min Included, Max Excluded (except for 100)
+                    let inFilter = true;
+                    if (scoreFilter) {
+                        if (finalScore < scoreFilter.min) inFilter = false;
+                        // Special case for top bucket (90-100), includes 100
+                        else if (scoreFilter.max === 100) {
+                            if (finalScore > 100) inFilter = false; 
+                        } else {
+                            if (finalScore >= scoreFilter.max) inFilter = false;
+                        }
+                    }
+
+                    if (inFilter && rows.length < rowsLimit) {
+                        rows.push({
+                            id: count,
+                            ...currentSelection,
+                            Score: finalScore
+                        });
+                    }
+
+                    return;
+                }
+
+                const key = factorKeys[depth];
+                const values = factors[key];
+
+                // Optimization: If a factor has no values, we can't form a valid combination. 
+                if (values.length === 0) return;
+
+                for (let i = 0; i < values.length; i++) {
+                    currentSelection[key] = values[i];
+                    dfs(depth + 1);
+                }
+            };
+
+            dfs(0);
+
+            const avg = count === 0 ? 0 : Math.round((sum / count) * 100) / 100;
+            if (count === 0) min = 0;
+
+            const histogramData = histogramBins.map((c, i) => ({
+                label: i < 9 ? `${i * 10}-${i * 10 + 9}` : '90-100',
+                count: c,
+                min: i * 10,
+                max: i < 9 ? (i + 1) * 10 : 100
+            }));
+
+            return {
+                stats: { min, max, avg, count },
+                histogramData,
+                rows
+            };
+        };
+
+
+        // Compute single score
+        const computeScore = (
+          categories: CategoryInfo[],
+          selected: Record<Factor, FactorValue>,
+          weights: Weights
+        ): number => {
+          let total = 0;
+          const normalizationGroups = new Map<number, Set<Factor>>();
+          categories.forEach((cat) => {
+            const normalization = typeof cat.value === "number" ? cat.value : 0;
+            if (normalization <= 0) return;
+            if (!normalizationGroups.has(normalization)) normalizationGroups.set(normalization, new Set<Factor>());
+            cat.factors.forEach((factor) => normalizationGroups.get(normalization)!.add(factor));
+          });
+
+          normalizationGroups.forEach((factorSet, normalization) => {
+            const factorWeightFracs: number[] = [];
+            factorSet.forEach((factor) => {
+              const selectedValue = selected[factor];
+              if (!selectedValue) return;
+              const key = getWeightKey(factor, selectedValue);
+              const rawWeight = weights[key] ?? 0;
+              const weightFrac = rawWeight / 100;
+              if (weightFrac !== 0) factorWeightFracs.push(weightFrac);
+            });
+
+            if (factorWeightFracs.length === 0) return;
+            let product = 1;
+            factorWeightFracs.forEach((w) => { product *= 1 - w; });
+            const combined = 1 - product; 
+            total += normalization * combined; 
+          });
+
+          return Math.round(clampScore(total) * 100) / 100;
+        };
+
+        // Build a text equation
+        const buildEquationExpression = (
+          categories: CategoryInfo[],
+          selected: Record<Factor, FactorValue>,
+          weights: Weights
+        ): string => {
+          const terms: string[] = [];
+          const normalizationGroups = new Map<number, Set<Factor>>();
+
+          categories.forEach((cat) => {
+            const normalization = typeof cat.value === "number" ? cat.value : 0;
+            if (normalization <= 0) return;
+            if (!normalizationGroups.has(normalization)) normalizationGroups.set(normalization, new Set<Factor>());
+            cat.factors.forEach((factor) => normalizationGroups.get(normalization)!.add(factor));
+          });
+
+          normalizationGroups.forEach((factorSet, normalization) => {
+            const weightFracs: number[] = [];
+            factorSet.forEach((factor) => {
+              const selectedValue = selected[factor];
+              if (!selectedValue) return;
+              const key = getWeightKey(factor, selectedValue);
+              const rawWeight = weights[key] ?? 0;
+              const weightFrac = rawWeight / 100;
+              if (weightFrac !== 0) weightFracs.push(weightFrac);
+            });
+
+            if (!weightFracs.length) return;
+
+            const innerParts = weightFracs.map((w) => {
+                const sign = w >= 0 ? '-' : '+';
+                const absW = Math.abs(w);
+                const weightDisplay = parseFloat(absW.toFixed(3)).toString(); 
+                return `(1 ${sign} ${weightDisplay})`;
+            });
+
+            const productExpr = innerParts.join(" * ");
+            const termExpr = `${normalization} * (1 - (${productExpr}))`; 
+            terms.push(termExpr);
+          });
+
+          const inside = terms.length ? terms.join(" + ") : "0";
+          return `MAX(0, MIN(100, ${inside}))`;
+        };
+
+        // ----- Initial Data (Default Mock) -----
+        const initialFactors: Record<Factor, FactorValue[]> = {
+          Severity: ["Critical", "High", "Medium", "Low", "Info"], 
+          "Business Impact": ["HBI", "MBI", "LBI", "No Project"],
+          "Secret Validity": ["Active", "Revoked", "Unknown"],
+          "File Type": ["Sensitive", "Insensitive", "Test"], 
+          "Publicly Exposed": ["Shared in Slack", "Public", "Not Public"],
+          "Exists In Latest Code": ["True", "False"],
+          "Organization Repository": ["True", "False"],
+          "Test File": ["True", "False"],
+          "Detected Recently": ["True", "False"],
+          "Archived Repository": ["Archived", "Not Archived"],
+          "Legacy Status": ["True"], 
+        };
+
+        const initialFactorCategories: Record<Factor, string> = {
+          Severity: "base-impact",
+          "Business Impact": "base-impact",
+          "Secret Validity": "base-impact", 
+          "File Type": "likelihood",
+          "Publicly Exposed": "likelihood",
+          "Exists In Latest Code": "likelihood",
+          "Organization Repository": "likelihood",
+          "Test File": "likelihood",
+          "Detected Recently": "likelihood",
+          "Archived Repository": "likelihood",
+          "Legacy Status": "likelihood",
+        };
+
+        const initialCategories: CategoryInfo[] = [
+          { id: "base-impact", label: "Base Impact / Secret Impact", value: 86, factors: ["Severity", "Business Impact", "Secret Validity"] }, 
+          { id: "likelihood", label: "Likelihood", value: 36, factors: ["File Type", "Publicly Exposed", "Exists In Latest Code", "Organization Repository", "Test File", "Detected Recently", "Archived Repository", "Legacy Status"] },
+        ];
+
+        const initialWeights: Weights = {
+            "Severity:Critical": 70, 
+            "Severity:High": 50,
+            "Severity:Medium": 25,
+            "Severity:Low": 2,
+            "Severity:Info": -10, 
+            "Business Impact:HBI": 45, 
+            "Business Impact:MBI": 25,
+            "Business Impact:LBI": 10,
+            "Business Impact:No Project": 1,
+            "Secret Validity:Active": 60, 
+            "Secret Validity:Revoked": 0,
+            "Secret Validity:Unknown": 0,
+            "File Type:Sensitive": 0, 
+            "File Type:Insensitive": 0,
+            "File Type:Test": 0,
+            "Publicly Exposed:Shared in Slack": 20, 
+            "Publicly Exposed:Public": 10, 
+            "Publicly Exposed:Not Public": 0,
+            "Exists In Latest Code:True": 20, 
+            "Exists In Latest Code:False": 0,
+            "Organization Repository:True": 10, 
+            "Organization Repository:False": 0,
+            "Test File:True": 30, 
+            "Test File:False": 0,
+            "Detected Recently:True": 10, 
+            "Detected Recently:False": 0,
+            "Archived Repository:Archived": 28, 
+            "Archived Repository:Not Archived": 0,
+            "Legacy Status:True": 10, 
+        };
+
+        const dummyDefaultFlags: Record<string, boolean> = { 
+            "Severity:Critical": true, 
+            "Business Impact:HBI": true, 
+            "Secret Validity:Active": true, 
+        }; 
+
+        const initialSelected: Record<Factor, FactorValue> = {
+            "Severity": "Critical",
+            "Business Impact": "HBI",
+            "Secret Validity": "Active",
+            "File Type": "Sensitive",
+            "Publicly Exposed": "Shared in Slack",
+            "Exists In Latest Code": "True",
+            "Organization Repository": "True",
+            "Test File": "True",
+            "Detected Recently": "True",
+            "Archived Repository": "Archived",
+            "Legacy Status": "True",
+        };
+
+        const processedInitial = addNAIfNoDefault(initialFactors, initialWeights, dummyDefaultFlags);
+
+        // Construct a pseudo-raw JSON for the default state to enable export even if no import happened
+        const constructDefaultJson = () => {
+            const fields = [];
+            const usedFactors = new Set();
+            
+            // Map categories to groups
+            const factorsInCategories = {};
+            initialCategories.forEach(cat => {
+                cat.factors.forEach(f => {
+                    if(!factorsInCategories[cat.id]) factorsInCategories[cat.id] = [];
+                    factorsInCategories[cat.id].push(f);
+                });
+            });
+
+            Object.keys(initialFactors).forEach(factorName => {
+                usedFactors.add(factorName);
+                const values = initialFactors[factorName];
+                const fieldWeights = values.map(val => {
+                    const key = `${factorName}:${val}`;
+                    return {
+                        name: val,
+                        weight: (initialWeights[key] || 0) / 100,
+                        is_default: dummyDefaultFlags[key] || false
+                    };
+                });
+                
+                // Find category
+                const catId = initialFactorCategories[factorName] || null;
+
+                fields.push({
+                    name: factorName,
+                    display_name: factorName,
+                    category: catId,
+                    weights: fieldWeights
+                });
+            });
+
+            return {
+                fields: fields,
+                related_resources: [],
+                category_normalizations: initialCategories.map(c => ({
+                    value: c.value,
+                    categories: [c.id]
+                }))
+            };
+        };
+        const defaultJsonStructure = constructDefaultJson();
+
+
+        const BarChart = ({ data, title, color, onBarClick, activeFilter }) => {
+            const width = 300;
+            const height = 150;
+            const padding = 20;
+            const maxCount = data.reduce((max, d) => Math.max(max, d.count), 0);
+            const scaleY = (count) => (count / Math.max(maxCount, 1)) * (height - 2 * padding);
+            const barWidth = (width - 2 * padding) / data.length;
+
+            return (
+                <div className="border border-slate-200 rounded-xl p-4 bg-white shadow-sm h-full flex flex-col">
+                    <div className="flex items-center gap-2 mb-3 text-sm font-semibold text-slate-700">
+                        <BarChart3 className={`w-4 h-4 text-${color}-600`} />
+                        {title}
+                    </div>
+                    
+                    {maxCount === 0 ? (
+                        <div className="text-center text-slate-400 text-xs flex-grow flex items-center justify-center">No data points to display.</div>
+                    ) : (
+                        <svg width="100%" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet" style={{ height: `${height}px` }}>
+                            <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="#ccc" />
+                            <text x={padding - 5} y={padding + 5} fontSize="8" fill="#64748B" textAnchor="end">{maxCount.toLocaleString()}</text>
+                            {data.map((d, i) => {
+                                const barHeight = scaleY(d.count);
+                                const x = padding + i * barWidth;
+                                const y = height - padding - barHeight;
+                                const isActive = activeFilter && activeFilter.label === d.label;
+                                const isFaded = activeFilter && !isActive;
+                                
+                                return (
+                                    <React.Fragment key={d.label}>
+                                        <rect
+                                            onClick={() => onBarClick(d.min, d.max, d.label)}
+                                            x={x + 2} y={y} width={barWidth - 4} height={barHeight}
+                                            fill={color} 
+                                            className={`cursor-pointer transition-all duration-300 ${isFaded ? 'fill-slate-300 opacity-50' : `fill-${color}-600 hover:fill-${color}-700`}`} 
+                                            rx="2" ry="2"
+                                        >
+                                            <title>{d.label}: {d.count.toLocaleString()}</title>
+                                        </rect>
+                                        <text x={x + barWidth / 2} y={height - padding + 10} fontSize="8" fill={isActive ? "#000" : "#64748B"} fontWeight={isActive ? "bold" : "normal"} textAnchor="middle">
+                                            {d.label.split('-')[0]}
+                                        </text>
+                                    </React.Fragment>
+                                );
+                            })}
+                        </svg>
+                    )}
+                    <div className="text-[9px] text-slate-500 text-center mt-1">Score Bins (0-100) - Click to Filter Table</div>
+                </div>
+            );
+        };
+
+        const StepperButton = ({ direction, onStep, Icon, stepValue = STEP_FINE }) => {
+            const timerRef = useRef(null);
+
+            const startStepping = useCallback((step) => {
+                if (timerRef.current !== null) clearInterval(timerRef.current);
+                onStep(step);
+                timerRef.current = window.setTimeout(() => {
+                    if (timerRef.current !== null) clearInterval(timerRef.current);
+                    timerRef.current = window.setInterval(() => {
+                        onStep(step);
+                    }, 50); 
+                }, ACCELERATION_DELAY_MS); 
+            }, [onStep]);
+
+            const stopStepping = useCallback(() => {
+                if (timerRef.current !== null) {
+                    clearInterval(timerRef.current);
+                    timerRef.current = null;
+                }
+            }, []);
+
+            const actualStep = direction === 'up' ? stepValue : -stepValue;
+
+            return (
+                <button
+                    type="button"
+                    className="w-8 h-8 rounded-lg bg-slate-100 text-purple-600 hover:bg-slate-200 transition active:bg-purple-200 active:ring-2 ring-purple-300 flex items-center justify-center shadow-sm"
+                    onMouseDown={() => startStepping(actualStep)}
+                    onMouseUp={stopStepping}
+                    onMouseLeave={stopStepping}
+                    onTouchStart={() => startStepping(actualStep)}
+                    onTouchEnd={stopStepping}
+                    title={direction === 'up' ? `+${stepValue}` : `-${stepValue}`}
+                >
+                    <Icon className="w-4 h-4" />
+                </button>
+            );
+        };
+
+        const WeightAdjustmentPopover = ({ factor, value, weights, setWeights, onClose, popoverRef }) => {
+          const key = getWeightKey(factor, value);
+          const currentRawWeight = weights[key] ?? 0;
+          const [tempWeight, setTempWeight] = useState(currentRawWeight / 100);
+
+          const handleSave = () => {
+            const rawWeightToSave = Math.round(Math.max(-100, Math.min(100, tempWeight * 100)));
+            setWeights((prev) => ({ ...prev, [key]: rawWeightToSave }));
+            onClose();
+          };
+
+          const updateWeight = (newFractionalWeight) => {
+            const clamped = Math.max(-1.00, Math.min(1.00, newFractionalWeight));
+            setTempWeight(Math.round(clamped * 100) / 100); 
+          }
+
+          const handleStep = useCallback((step) => {
+            let newWeight = tempWeight + step;
+            if (newWeight > 1.00) newWeight = 1.00;
+            if (newWeight < -1.00) newWeight = -1.00;
+            updateWeight(newWeight);
+          }, [tempWeight]);
+
+          return (
+            <div ref={popoverRef} className="absolute top-full left-1/2 -translate-x-1/2 z-20 mt-2 w-64 rounded-xl border border-slate-200 bg-white p-4 shadow-2xl animate-in fade-in zoom-in duration-200">
+              <div className="text-sm font-bold text-slate-800 mb-3 truncate border-b border-slate-100 pb-2 text-center">
+                {factor} / {value}
+              </div>
+              <div className="flex items-center gap-2 mb-4">
+                <StepperButton direction="down" onStep={handleStep} Icon={Minus} />
+                <input
+                  type="number" min={-1.00} max={1.00} step={STEP_FINE} 
+                  value={parseFloat(tempWeight.toFixed(2)).toString()}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (!isNaN(val)) updateWeight(val);
+                  }}
+                  className="w-full text-center text-xl font-bold text-purple-700 border border-slate-300 rounded-lg p-1 focus:ring-2 focus:ring-purple-500 transition"
+                />
+                <StepperButton direction="up" onStep={handleStep} Icon={Plus} />
+              </div>
+              <div className="relative mb-4">
+                <input
+                    type="range" min={-100} max={100} step={1} 
+                    value={Math.round(tempWeight * 100)}
+                    onChange={(e) => updateWeight(Number(e.target.value) / 100)}
+                    className="w-full h-2 bg-purple-100 rounded-lg appearance-none cursor-pointer accent-purple-600"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500 mt-1"><span>-1</span><span>0</span><span>+1</span></div>
+              </div>
+              <div className="mt-4 flex justify-end gap-2 border-t border-slate-100 pt-3">
+                <button type="button" className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 transition" onClick={onClose}>Cancel</button>
+                <button type="button" className="text-xs px-3 py-1.5 rounded-lg bg-purple-600 text-white font-medium shadow-md shadow-purple-200 hover:bg-purple-700 transition" onClick={handleSave}>Save</button>
+              </div>
+            </div>
+          );
+        };
+
+        const NormalizationAdjustmentPopover = ({ currentValue, categoryIds, onUpdate, onClose, popoverRef }) => {
+            const [tempValue, setTempValue] = useState(currentValue);
+            const handleSave = () => onUpdate(categoryIds, tempValue);
+            const handleStep = useCallback((step) => {
+                setTempValue(Math.max(0, Math.min(100, tempValue + step)));
+            }, [tempValue]);
+
+            return (
+                <div ref={popoverRef} className="absolute top-full right-0 z-20 mt-2 w-64 rounded-xl border border-slate-200 bg-white p-4 shadow-2xl animate-in fade-in zoom-in duration-200">
+                    <div className="flex items-center gap-2 mb-4 mt-2">
+                        <StepperButton direction="down" onStep={handleStep} Icon={Minus} stepValue={1} />
+                        <input
+                            type="number" min={0} max={100} step={1} value={tempValue}
+                            onChange={(e) => {
+                                const val = parseInt(e.target.value);
+                                if (!isNaN(val)) setTempValue(Math.max(0, Math.min(100, val)));
+                            }}
+                            className="w-full text-center text-xl font-bold text-purple-700 border border-slate-300 rounded-lg p-1 focus:ring-2 focus:ring-purple-500 transition"
+                        />
+                        <StepperButton direction="up" onStep={handleStep} Icon={Plus} stepValue={1} />
+                    </div>
+                    <div className="relative mb-4">
+                        <input
+                            type="range" min={0} max={100} step={1} value={tempValue}
+                            onChange={(e) => setTempValue(Number(e.target.value))}
+                            className="w-full h-2 bg-purple-100 rounded-lg appearance-none cursor-pointer accent-purple-600"
+                        />
+                        <div className="flex justify-between text-[10px] text-slate-500 mt-1"><span>0</span><span>50</span><span>100</span></div>
+                    </div>
+                    <div className="mt-4 flex justify-end gap-2 border-t border-slate-100 pt-3">
+                        <button type="button" className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 transition" onClick={onClose}>Cancel</button>
+                        <button type="button" className="text-xs px-3 py-1.5 rounded-lg bg-purple-600 text-white font-medium shadow-md shadow-purple-200 hover:bg-purple-700 transition" onClick={handleSave}>Save</button>
+                    </div>
+                </div>
+            );
+        };
+
+        const FactorRow = ({ factor, values, selected, weights, defaultFlags, onSelect, openWeight, setOpenWeight, setWeights, popoverRef }) => {
+          const clickTimerRef = useRef(null);
+          const clickCountRef = useRef(0);
+
+          const openWeightEditor = (value) => setOpenWeight({ factor, value });
+
+          const handleClickDelay = (value) => {
+            clickCountRef.current += 1;
+            if (clickTimerRef.current) {
+                clearTimeout(clickTimerRef.current);
+                clickTimerRef.current = null;
+                clickCountRef.current = 0;
+                openWeightEditor(value); 
+                return;
+            }
+            clickTimerRef.current = window.setTimeout(() => {
+                clickTimerRef.current = null;
+                clickCountRef.current = 0;
+                onSelect(factor, value);
+                setOpenWeight((current) => current && current.factor === factor && current.value === value ? null : current);
+            }, DOUBLE_CLICK_DELAY);
+          };
+          
+          const formatWeightDisplay = (rawWeightValue) => parseFloat((rawWeightValue / 100).toFixed(2)).toString();
+          
+          return (
+            <div key={factor} className="space-y-1"> 
+              <div className="text-sm font-semibold text-slate-800 flex flex-wrap items-center gap-2">
+                <span className="shrink-0">{factor}:</span>
+                <div className="flex flex-wrap gap-2">
+                  {values.map((value) => {
+                    const key = getWeightKey(factor, value);
+                    const rawWeightValue = weights[key] ?? 0;
+                    const isSelected = selected[factor] === value;
+                    const isDefault = !!defaultFlags[key];
+                    const isOpen = !!openWeight && openWeight.factor === factor && openWeight.value === value;
+                    const weightDisplay = formatWeightDisplay(rawWeightValue);
+                    const isNA = value === "N/A";
+
+                    let chipClass = `relative flex items-center gap-1 rounded-full border px-3 py-1 text-xs transition shadow-sm font-medium cursor-pointer ${
+                      isSelected ? " bg-purple-50 border-purple-500 text-purple-700 ring-2 ring-purple-200" : isDefault ? " border-2 border-amber-500 text-amber-800 bg-amber-50" : " bg-white border-slate-200 text-slate-700 hover:border-slate-300 hover:shadow-md"
+                    }`;
+                    if (isNA && !isSelected && !isDefault) chipClass = "relative flex items-center gap-1 rounded-full border px-3 py-1 text-xs transition shadow-sm font-medium cursor-pointer bg-slate-100 border-slate-300 text-slate-500 hover:border-slate-400";
+
+                    return (
+                      <div key={value} className="relative inline-block">
+                        <button type="button" onClick={() => handleClickDelay(value)} className={chipClass}>
+                          <span>{value}</span>
+                          <span className={`text-[10px] opacity-70 ml-1 ${isDefault ? 'text-amber-700' : 'text-purple-500 font-bold'}`}>({weightDisplay})</span>
+                          {isDefault && <span className="absolute -top-1 -right-1 text-[9px] text-amber-500" title="Default Value"><Lightbulb className="w-3 h-3"/></span>}
+                        </button>
+                        <button type="button" aria-label="Adjust weight" onClick={(e) => { e.stopPropagation(); openWeightEditor(value); }} className="absolute -right-1 -top-1 h-5 w-5 rounded-full border border-purple-200 bg-white text-[10px] flex items-center justify-center shadow-lg text-purple-600 hover:bg-purple-50 transition z-10"><Sliders className="w-3 h-3"/></button>
+                        {isOpen && <WeightAdjustmentPopover factor={factor} value={value} weights={weights} setWeights={setWeights} onClose={() => setOpenWeight(null)} popoverRef={popoverRef} />}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        const CombinationsTable = ({ totalPotentialCount, filteredCombinations, factorNames, selected, tableRef, isTooLarge, displayLimit, filteredTotalCount, scoreFilter }) => { 
+            const [currentPage, setCurrentPage] = useState(1);
+            const [sortConfig, setSortConfig] = useState(null);
+            
+            // Sort logic
+            const sortedCombinations = useMemo(() => {
+                let sortableItems = [...filteredCombinations];
+                if (sortConfig !== null) {
+                    sortableItems.sort((a, b) => {
+                        const aValue = a[sortConfig.key] ?? '';
+                        const bValue = b[sortConfig.key] ?? '';
+                        if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
+                        if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
+                        return 0;
+                    });
+                }
+                return sortableItems;
+            }, [filteredCombinations, sortConfig]);
+
+            const requestSort = (key) => {
+                let direction = 'asc';
+                if (sortConfig && sortConfig.key === key && sortConfig.direction === 'asc') {
+                    direction = 'desc';
+                }
+                setSortConfig({ key, direction });
+            };
+
+            // Pagination logic
+            const totalPages = Math.ceil(sortedCombinations.length / PAGE_SIZE);
+            const startIdx = (currentPage - 1) * PAGE_SIZE;
+            const endIdx = startIdx + PAGE_SIZE;
+            const currentRows = sortedCombinations.slice(startIdx, endIdx);
+
+            // Reset page when data changes
+            useEffect(() => {
+                setCurrentPage(1);
+            }, [filteredCombinations.length]);
+
+            const handlePageChange = (newPage) => {
+                if (newPage >= 1 && newPage <= totalPages) setCurrentPage(newPage);
+            };
+
+            const formatCount = (count) => totalPotentialCount >= Number.MAX_SAFE_INTEGER ? 'Too Large' : count.toLocaleString();
+            
+            // Determine columns order: #, Score, then rest of factors
+            const columns = ['#', 'Score', ...factorNames];
+
+            return (
+                <div ref={tableRef} className="bg-white border border-slate-200 rounded-2xl shadow-xl shadow-slate-100/50">
+                    <div className="p-4 flex items-center justify-between border-b border-slate-100">
+                        <div className="flex items-center gap-2">
+                            <Hash className="w-5 h-5 text-purple-600" />
+                            <h2 className="text-lg font-semibold text-slate-800">Possible Combinations</h2>
+                            <span className="text-sm font-medium text-slate-500 ml-2">
+                                {scoreFilter 
+                                    ? `(Filtered: ${filteredCombinations.length.toLocaleString()} shown in table based on range ${scoreFilter.min}-${scoreFilter.max})`
+                                    : `(${filteredTotalCount.toLocaleString()} matches / {formatCount(totalPotentialCount)} total)`
+                                }
+                            </span>
+                        </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                        {filteredCombinations.length > 0 ? (
+                            <>
+                                <table className="min-w-full divide-y divide-slate-200">
+                                    <thead className="bg-slate-50">
+                                        <tr>
+                                            {columns.map(col => (
+                                                <th 
+                                                    key={col} 
+                                                    className={`px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider whitespace-nowrap bg-slate-50 ${col === 'Score' ? 'cursor-pointer hover:bg-slate-100' : ''}`}
+                                                    onClick={col === 'Score' ? () => requestSort('Score') : undefined}
+                                                >
+                                                    <div className="flex items-center gap-1">
+                                                        {col}
+                                                        {col === 'Score' && <ArrowUpDown className="w-3 h-3" />}
+                                                    </div>
+                                                </th>
+                                            ))}
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100">
+                                        {currentRows.map(combination => (
+                                            <tr key={combination.id} className="hover:bg-purple-50 transition duration-150">
+                                                {columns.map(col => {
+                                                    const isSelected = selected[col] && combination[col] === selected[col]; 
+                                                    let cellValue;
+                                                    if (col === '#') cellValue = combination.id;
+                                                    else if (col === 'Score') cellValue = (combination.Score).toFixed(2);
+                                                    else cellValue = combination[col] || '-';
+                                                    
+                                                    return (
+                                                        <td key={col} className={`px-4 py-2 text-sm whitespace-nowrap ${col === '#' ? 'font-mono text-slate-500' : 'text-slate-800'} ${col === 'Score' ? 'font-bold text-purple-700 bg-purple-100' : ''} ${isSelected ? 'bg-purple-200 font-bold' : ''}`}>
+                                                            {cellValue}
+                                                        </td>
+                                                    );
+                                                })}
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                {totalPages > 1 && (
+                                    <div className="px-4 py-3 flex items-center justify-between border-t border-slate-200">
+                                        <div className="text-sm text-slate-600">
+                                            Showing {startIdx + 1} - {Math.min(endIdx, sortedCombinations.length)} of {sortedCombinations.length}
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <button onClick={() => handlePageChange(currentPage - 1)} disabled={currentPage === 1} className="p-1 rounded-full hover:bg-slate-100 disabled:opacity-50 text-slate-600"><ChevronLeft className="w-5 h-5" /></button>
+                                            <span className="text-sm font-medium text-slate-800">Page {currentPage} of {totalPages}</span>
+                                            <button onClick={() => handlePageChange(currentPage + 1)} disabled={currentPage === totalPages} className="p-1 rounded-full hover:bg-slate-100 disabled:opacity-50 text-slate-600"><ChevronRight className="w-5 h-5" /></button>
+                                        </div>
+                                    </div>
+                                )}
+                            </>
+                        ) : (
+                            <div className="p-6 text-center text-slate-500 text-sm">
+                                No combinations match the current factor selection {scoreFilter ? 'and score filter' : ''}.
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        function App() {
+          const tableRef = useRef(null); 
+          const weightPopoverRef = useRef(null);
+          const normalizationPopoverRef = useRef(null);
+
+          const { factors: initialProcessedFactors, weights: initialProcessedWeights } = processedInitial;
+
+          const [db, setDb] = useState(null);
+          const [auth, setAuth] = useState(null);
+          const [userId, setUserId] = useState(null);
+          const [isAuthReady, setIsAuthReady] = useState(false);
+
+          const [factors, setFactors] = useState(initialProcessedFactors);
+          const [selected, setSelected] = useState(initialSelected);
+          const [openWeight, setOpenWeight] = useState(null);
+          const [openNormalization, setOpenNormalization] = useState(null); 
+          const [weights, setWeights] = useState(initialProcessedWeights);
+          const [factorCategories, setFactorCategories] = useState(initialFactorCategories);
+          const [categories, setCategories] = useState(initialCategories);
+          const [defaultFlags, setDefaultFlags] = useState(dummyDefaultFlags); 
+          const [showEquation, setShowEquation] = useState(false);
+          const [showNotification, setShowNotification] = useState(null);
+          const [combinationThreshold, setCombinationThreshold] = useState(DEFAULT_COMBINATIONS_THRESHOLD);
+          const [tableDisplayLimit, setTableDisplayLimit] = useState(DEFAULT_TABLE_DISPLAY_LIMIT);
+          const [showLimits, setShowLimits] = useState(false);
+          const [scoreFilter, setScoreFilter] = useState(null);
+
+          // --- EXPORT / IMPORT STATE TRACKING ---
+          const [rawImportedJson, setRawImportedJson] = useState(defaultJsonStructure);
+          const [originalWeights, setOriginalWeights] = useState(initialProcessedWeights);
+          const [originalCategories, setOriginalCategories] = useState(initialCategories);
+
+          // Check for changes (Memoized to avoid recalc on every render unless weights/cats change)
+          const hasChanges = useMemo(() => {
+            // 1. Check Weights
+            for (const key in weights) {
+                if (weights[key] !== originalWeights[key]) {
+                     return true; 
+                }
+            }
+            // Check if keys were removed or added
+            if (Object.keys(weights).length !== Object.keys(originalWeights).length) return true;
+
+            // 2. Check Categories (Normalizations)
+            for (const cat of categories) {
+                const original = originalCategories.find(c => c.id === cat.id);
+                if (!original) return true; // Category added?
+                if (cat.value !== original.value) return true;
+            }
+            if (categories.length !== originalCategories.length) return true;
+
+            return false;
+          }, [weights, categories, originalWeights, originalCategories]);
+
+
+          useEffect(() => {
+            const initFirebase = async () => {
+              try {
+                // Mock config if not provided in environment
+                const firebaseConfig = {};
+                if (Object.keys(firebaseConfig).length === 0) {
+                    setUserId(crypto.randomUUID());
+                    setIsAuthReady(true);
+                    return;
+                }
+                const app = initializeApp(firebaseConfig);
+                setDb(getFirestore(app));
+                const firebaseAuth = getAuth(app);
+                setAuth(firebaseAuth);
+                const token = null;
+                const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+                    setUserId(user ? user.uid : crypto.randomUUID());
+                    setIsAuthReady(true);
+                });
+                if (token) await signInWithCustomToken(firebaseAuth, token);
+                else await signInAnonymously(firebaseAuth);
+                return () => unsubscribe();
+              } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                setUserId(crypto.randomUUID());
+                setIsAuthReady(true);
+              }
+            };
+            initFirebase();
+          }, []);
+
+          const scrollToTable = useCallback(() => {
+            tableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, []);
+
+          // --- CORE CALCS ---
+          const calculatedScore = useMemo(() => computeScore(categories, selected, weights), [categories, selected, weights]);
+          const equationText = useMemo(() => buildEquationExpression(categories, selected, weights), [categories, selected, weights]);
+          
+          // --- OPTIMIZED SCALABILITY LOGIC ---
+
+          const totalPotentialCountUnfiltered = useMemo(() => calculateTotalCombinations(factors), [factors]);
+          
+          const currentFactorState = useMemo(() => {
+            const state = {};
+            for (const factorName in factors) {
+                if (selected[factorName]) {
+                    state[factorName] = [selected[factorName]];
+                } else {
+                    state[factorName] = factors[factorName];
+                }
+            }
+            return state;
+          }, [factors, selected]);
+
+          const totalPotentialCountFiltered = useMemo(() => calculateTotalCombinations(currentFactorState), [currentFactorState]);
+          const isTooLarge = totalPotentialCountFiltered > tableDisplayLimit;
+          const isOverProcessingLimit = totalPotentialCountFiltered > combinationThreshold;
+
+          // Process data for the Filtered selection
+          const processedData = useMemo(() => {
+              if (isOverProcessingLimit) {
+                  return { 
+                      stats: { min: calculatedScore, max: calculatedScore, avg: calculatedScore, count: 1 }, 
+                      histogramData: [], 
+                      rows: [] 
+                  };
+              }
+              // Pass the active score filter to only get relevant rows
+              return processCombinationsEfficiently(currentFactorState, categories, weights, tableDisplayLimit, scoreFilter);
+          }, [currentFactorState, categories, weights, isOverProcessingLimit, calculatedScore, tableDisplayLimit, scoreFilter]);
+
+          const { stats: scoreStats, histogramData: filteredHistogramData, rows: filteredScoredCombinations } = processedData;
+
+          // Restore Total Potential Combinations Graph:
+          const totalProcessedData = useMemo(() => {
+              if (totalPotentialCountUnfiltered > combinationThreshold) return null;
+              return processCombinationsEfficiently(factors, categories, weights, 0, null); 
+          }, [factors, categories, weights, totalPotentialCountUnfiltered, combinationThreshold]);
+
+          const totalHistogramData = totalProcessedData ? totalProcessedData.histogramData : [];
+
+          const factorNames = useMemo(() => Object.keys(factors).sort(), [factors]); 
+          const factorsWithMultipleValues = useMemo(() => Object.keys(factors).filter(f => factors[f].length > 1), [factors]);
+
+          // Handle value selection
+          const handleSelect = useCallback((factor, value) => {
+            setSelected((prev) => {
+                if (prev[factor] === value) {
+                    const clone = { ...prev };
+                    delete clone[factor];
+                    return clone;
+                }
+                return { ...prev, [factor]: value };
+            });
+          }, []);
+
+          const categoryGroups = useMemo(() => {
+            if (categories.length === 0) return [];
+            const map = new Map();
+            categories.forEach((cat) => {
+              const valueKey = cat.value === null ? `none-${cat.id}` : String(cat.value);
+              if (!map.has(valueKey)) map.set(valueKey, { value: cat.value, labels: [], factors: new Set(), categoryIds: new Set() });
+              const entry = map.get(valueKey);
+              entry.labels.push(cat.label);
+              cat.factors.forEach((f) => entry.factors.add(f));
+              entry.categoryIds.add(cat.id);
+            });
+            const groups = [];
+            map.forEach((entry, key) => groups.push({ key, value: entry.value, labels: entry.labels, factors: Array.from(entry.factors), categoryIds: Array.from(entry.categoryIds) }));
+            return groups;
+          }, [categories]);
+
+          const handleUpdateCategoryGroupWeight = useCallback((categoryIds, newValue) => {
+            setCategories((prev) => prev.map((cat) => categoryIds.includes(cat.id) ? { ...cat, value: newValue } : cat));
+            setOpenNormalization(null);
+          }, []);
+
+          const leftoverFactors = useMemo(() => {
+            const groupedFactorNames = new Set();
+            categoryGroups.forEach((g) => g.factors.forEach((f) => groupedFactorNames.add(f)));
+            return Object.keys(factors).filter((f) => !groupedFactorNames.has(f) && !!factors[f] && factors[f].length > 0);
+          }, [factors, categoryGroups]);
+
+          const handleImportFormula = async (event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              try {
+                const text = String(e.target?.result || "");
+                if (!text) return;
+                const json = JSON.parse(text);
+                
+                // --- 1. Store Raw JSON ---
+                setRawImportedJson(json);
+
+                const newFactors = {};
+                let newWeights = {};
+                const newFactorCategories = {};
+                const newDefaultFlags = {}; 
+                const categoryMap = {};
+                const ensureCategory = (categoryId) => {
+                  if (!categoryMap[categoryId]) categoryMap[categoryId] = { label: prettifyLabel(categoryId), value: null, factors: new Set() };
+                  return categoryMap[categoryId];
+                };
+                const processField = (field) => {
+                  if (!field || !Array.isArray(field.weights)) return;
+                  const factorLabel = field.display_name || field.name || field.id;
+                  const valueNames = [];
+                  field.weights.forEach((w) => {
+                    const valueLabel = w.name || w.key;
+                    valueNames.push(valueLabel);
+                    const key = getWeightKey(factorLabel, valueLabel);
+                    let weightValue = typeof w.weight === "number" ? w.weight : 0;
+                    if (weightValue > -100 && weightValue < 1 && weightValue > 0) weightValue = Math.round(weightValue * 100);
+                    else if (weightValue < 0 && weightValue > -100) weightValue = Math.round(weightValue * 100);
+                    newWeights[key] = weightValue;
+                    if (w && w.is_default === true) newDefaultFlags[key] = true;
+                  });
+                  if (valueNames.length) newFactors[factorLabel] = valueNames;
+                  if (field.category) {
+                    const cat = ensureCategory(field.category);
+                    cat.factors.add(factorLabel);
+                    newFactorCategories[factorLabel] = field.category;
+                  }
+                };
+                if (Array.isArray(json.fields)) json.fields.forEach(processField);
+                if (Array.isArray(json.related_resources)) json.related_resources.forEach((res) => { if (Array.isArray(res.fields)) res.fields.forEach(processField); });
+                const naResult = addNAIfNoDefault(newFactors, newWeights, newDefaultFlags);
+                const finalFactors = naResult.factors;
+                newWeights = naResult.weights;
+                setDefaultFlags(newDefaultFlags); 
+                if (Array.isArray(json.category_normalizations)) {
+                  json.category_normalizations.forEach((entry) => {
+                    const value = typeof entry.value === "number" ? entry.value : null;
+                    if (!Array.isArray(entry.categories)) return;
+                    entry.categories.forEach((catId) => {
+                      const cat = ensureCategory(catId);
+                      if (value !== null) cat.value = value;
+                    });
+                  });
+                }
+                if (Object.keys(finalFactors).length === 0) throw new Error("Formula JSON contains no fields with weights.");
+                const newCategories = Object.entries(categoryMap).map(([id, info]) => ({ id, label: info.label, value: info.value, factors: Array.from(info.factors) }));
+                setFactors(finalFactors);
+                setWeights(newWeights);
+                setFactorCategories(newFactorCategories);
+                setCategories(newCategories);
+                setSelected({});
+                setOpenWeight(null);
+
+                // --- 2. Update Original Baselines for Change Detection ---
+                setOriginalWeights(newWeights);
+                setOriginalCategories(newCategories);
+
+                setShowNotification("Formula imported successfully! Combinations table updated.");
+              } catch (err) {
+                console.error("Failed to import formula JSON", err);
+                setShowNotification(`Invalid formula JSON file: ${err instanceof Error ? err.message : 'Check console for details.'}`);
+              }
+            };
+            reader.readAsText(file);
+          };
+          
+          const handleExportFormula = () => {
+            try {
+                if (!rawImportedJson) {
+                    setShowNotification("No formula structure available to export.");
+                    return;
+                }
+
+                // Deep clone to avoid mutating state directly
+                const jsonToExport = JSON.parse(JSON.stringify(rawImportedJson));
+
+                // Helper to update weights in a field list
+                const updateFields = (fieldsList) => {
+                    if (!Array.isArray(fieldsList)) return;
+                    fieldsList.forEach(field => {
+                        const factorLabel = field.display_name || field.name || field.id;
+                        if (!field.weights || !Array.isArray(field.weights)) return;
+
+                        field.weights.forEach((w) => {
+                             const valueLabel = w.name || w.key;
+                             const key = getWeightKey(factorLabel, valueLabel);
+                             // Check if we have a current weight for this
+                             if (weights.hasOwnProperty(key)) {
+                                 // Convert integer -100 to 100 back to float -1.00 to 1.00
+                                 const rawVal = weights[key];
+                                 w.weight = rawVal / 100;
+                             }
+                        });
+                    });
+                };
+
+                // 1. Update Weights in 'fields'
+                if (jsonToExport.fields) updateFields(jsonToExport.fields);
+
+                // 2. Update Weights in 'related_resources'
+                if (jsonToExport.related_resources && Array.isArray(jsonToExport.related_resources)) {
+                    jsonToExport.related_resources.forEach((res) => {
+                        if (res.fields) updateFields(res.fields);
+                    });
+                }
+
+                // 3. Update Category Normalizations
+                if (jsonToExport.category_normalizations && Array.isArray(jsonToExport.category_normalizations)) {
+                    const currentCatMap = new Map();
+                    categories.forEach(c => {
+                        if (c.value !== null) currentCatMap.set(c.id, c.value);
+                    });
+
+                    jsonToExport.category_normalizations.forEach((normEntry) => {
+                         if (Array.isArray(normEntry.categories) && normEntry.categories.length > 0) {
+                             const representativeId = normEntry.categories[0];
+                             if (currentCatMap.has(representativeId)) {
+                                 normEntry.value = currentCatMap.get(representativeId);
+                             }
+                         }
+                    });
+                }
+
+                // Create and Download Blob
+                const blob = new Blob([JSON.stringify(jsonToExport, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = "risk_formula_optimized.json";
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                
+                setShowNotification("Formula exported successfully!");
+
+            } catch (err) {
+                console.error("Export failed", err);
+                setShowNotification("Failed to export formula.");
+            }
+          };
+
+          useEffect(() => {
+            if (showNotification) {
+              const timer = setTimeout(() => setShowNotification(null), 5000);
+              return () => clearTimeout(timer);
+            }
+          }, [showNotification]);
+
+          const handleCopyEquation = () => {
+            if (!equationText) return;
+            const tempElement = document.createElement('textarea');
+            tempElement.value = equationText;
+            document.body.appendChild(tempElement);
+            tempElement.select();
+            try {
+                document.execCommand('copy');
+                setShowNotification("Equation copied to clipboard!");
+            } catch (err) {
+                console.error('Failed to copy', err);
+                setShowNotification("Failed to copy equation.");
+            }
+            document.body.removeChild(tempElement);
+          };
+          
+          const handleThresholdChange = (e) => {
+              const value = parseInt(e.target.value);
+              if (!isNaN(value) && value > 0 && isFinite(value)) setCombinationThreshold(value);
+              else setCombinationThreshold(DEFAULT_COMBINATIONS_THRESHOLD);
+          };
+
+          const handleTableLimitChange = (e) => {
+              const value = parseInt(e.target.value);
+              if (!isNaN(value) && value > 0 && isFinite(value)) setTableDisplayLimit(value);
+              else setTableDisplayLimit(DEFAULT_TABLE_DISPLAY_LIMIT);
+          };
+
+          const handleHistogramBarClick = (min, max, label) => {
+              if (scoreFilter && scoreFilter.label === label) {
+                  setScoreFilter(null);
+              } else {
+                  setScoreFilter({ min, max, label });
+              }
+              scrollToTable();
+          };
+
+          const handleClickOutside = useCallback((event) => {
+            if (openWeight && weightPopoverRef.current && !weightPopoverRef.current.contains(event.target)) setOpenWeight(null);
+            if (openNormalization && normalizationPopoverRef.current && !normalizationPopoverRef.current.contains(event.target)) setOpenNormalization(null);
+          }, [openWeight, openNormalization]);
+
+          useEffect(() => {
+            document.addEventListener("mousedown", handleClickOutside);
+            return () => document.removeEventListener("mousedown", handleClickOutside);
+          }, [handleClickOutside]);
+
+          return (
+            <div className="min-h-screen bg-slate-50 py-8 px-4 font-inter">
+              <div className="max-w-7xl mx-auto space-y-8">
+                
+                {showNotification && (
+                    <div className={`fixed top-4 right-4 z-50 p-3 rounded-xl text-sm shadow-xl transition-all duration-300 ${showNotification.includes('successfully') ? 'bg-green-500 text-white' : 'bg-red-500 text-white'}`}>
+                        {showNotification}
+                    </div>
+                )}
+
+                {/* HEADER & INFO - Redesigned Top Section */}
+                <div className="flex flex-col md:flex-row items-center justify-between py-4 border-b border-slate-200">
+                  <div className="flex-grow mb-4 md:mb-0">
+                    <h1 className="text-3xl font-extrabold text-slate-900 flex items-center gap-3">
+                        <Calculator className="w-8 h-8 text-purple-600"/>
+                        Risk Score Formula Optimizer
+                    </h1>
+                  </div>
+                  
+                  {/* Action Buttons Container - FIXED: Vertical stack (flex-col) to ensure Import is above Export */}
+                  <div className="flex flex-col gap-3 w-full md:w-64"> 
+                    
+                    {/* Import Button */}
+                    <label className="flex items-center justify-center w-full text-sm text-slate-700 border border-slate-300 rounded-xl px-4 py-2 bg-white hover:bg-slate-50 transition font-medium cursor-pointer shadow-sm">
+                      <FileText className="w-4 h-4 mr-2"/>
+                      Import Formula JSON
+                      <input type="file" accept="application/json" onChange={handleImportFormula} className="hidden" />
+                    </label>
+
+                    {/* EXPORT BUTTON */}
+                    <div className="w-full" title={!hasChanges ? "No changes made to the formula" : "Export the current weights and normalization changes"}>
+                        <button 
+                            onClick={handleExportFormula}
+                            disabled={!hasChanges}
+                            className={`flex items-center justify-center w-full text-sm rounded-xl px-4 py-2 font-medium shadow-md transition
+                                ${!hasChanges 
+                                    ? 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed' 
+                                    : 'bg-purple-600 text-white border border-purple-700 shadow-purple-200 hover:bg-purple-700 cursor-pointer'
+                                }`}
+                        >
+                            <Download className="w-4 h-4 mr-2"/>
+                            Export new Formula JSON
+                        </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* MAIN GRID */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+                  
+                  {/* LEFT: Factors */}
+                  <div className="lg:col-span-2 space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <BarChart 
+                            data={isOverProcessingLimit ? [] : filteredHistogramData} 
+                            title="Filtered Score Distribution" 
+                            color="purple" 
+                            onBarClick={handleHistogramBarClick}
+                            activeFilter={scoreFilter}
+                        />
+                        <BarChart 
+                            data={totalHistogramData.length > 0 ? totalHistogramData : []} 
+                            title="Total Possible Score Distribution" 
+                            color="slate" 
+                            onBarClick={() => {}} 
+                            activeFilter={null}
+                        />
+                    </div>
+                    
+                    {/* Category Groups */}
+                    {categoryGroups.length > 0 && (
+                      <div className="space-y-6">
+                        {categoryGroups.map((group) => {
+                          const groupFactors = group.factors.filter((f) => !!factors[f] && factors[f].length > 0);
+                          if (!groupFactors.length) return null;
+                          return (
+                            <div key={group.key} className="rounded-2xl bg-white border border-slate-200 shadow-xl shadow-slate-100/50 p-5 space-y-4">
+                              <div className="flex items-start justify-between border-b border-slate-100 pb-3 -mx-2 px-2">
+                                <div>
+                                  <div className="text-sm font-bold uppercase tracking-wide text-purple-600">{group.labels.join(" / ")}</div>
+                                  <div className="text-xs text-slate-500">Category Impact Group</div>
+                                </div>
+                                <div className="text-sm text-slate-500 text-right flex flex-col items-end gap-1">
+                                  {group.value !== null && (
+                                    <div className="relative">
+                                        <button type="button" className={`relative flex items-center gap-1 rounded-full border px-3 py-1 text-sm transition shadow-sm font-medium cursor-pointer bg-purple-50 border-purple-500 text-purple-700 ring-2 ring-purple-200`} onClick={() => setOpenNormalization(group.key === openNormalization ? null : group.key)}>
+                                            Normalization ({group.value}) <Sliders className="w-4 h-4 ml-1" />
+                                        </button>
+                                        {openNormalization === group.key && <NormalizationAdjustmentPopover currentValue={group.value ?? 0} categoryIds={group.categoryIds} onUpdate={handleUpdateCategoryGroupWeight} onClose={() => setOpenNormalization(null)} popoverRef={normalizationPopoverRef} />}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="space-y-2 pt-2"> 
+                                {groupFactors.map((factor) => 
+                                    <FactorRow key={factor} factor={factor} values={factors[factor] || []} selected={selected} weights={weights} defaultFlags={defaultFlags} onSelect={handleSelect} openWeight={openWeight} setOpenWeight={setOpenWeight} setWeights={setWeights} popoverRef={weightPopoverRef} />
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    
+                    {leftoverFactors.length > 0 && (
+                      <div className="rounded-2xl bg-white border border-dashed border-slate-300 shadow-xl shadow-slate-100/50 p-5 space-y-4">
+                        <div className="border-b border-slate-100 pb-3 -mx-2 px-2">
+                            <div className="text-sm font-bold uppercase tracking-wide text-slate-500">Ungrouped Factors</div>
+                        </div>
+                        <div className="space-y-2 pt-2"> 
+                            {leftoverFactors.map((factor) => 
+                                <FactorRow key={factor} factor={factor} values={factors[factor] || []} selected={selected} weights={weights} defaultFlags={defaultFlags} onSelect={handleSelect} openWeight={openWeight} setOpenWeight={setOpenWeight} setWeights={setWeights} popoverRef={weightPopoverRef} />
+                            )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* RIGHT: Summary */}
+                  <div className="lg:col-span-1 space-y-6 lg:sticky lg:top-8">
+                    <div className="p-6 rounded-2xl bg-white border border-purple-300 text-sm text-slate-700 shadow-2xl shadow-purple-100/80 relative">
+                      
+                      <div className="flex items-center gap-4 mb-4">
+                        <div className="font-bold text-lg text-slate-900">Risk Score</div>
+                        
+                        {/* Score Frame - Toggles Equation */}
+                        <button 
+                          onClick={() => setShowEquation(!showEquation)}
+                          className="relative bg-purple-50 border-2 border-purple-100 rounded-xl px-4 py-1 cursor-pointer hover:border-purple-300 transition group flex items-center"
+                        >
+                          <div className="text-2xl font-extrabold text-purple-700">
+                            {calculatedScore.toFixed(2)}
+                          </div>
+                          
+                          {/* Overlapping Icon at corner (Badge Style) */}
+                          <div className="absolute -top-3 -right-3 bg-white rounded-full p-1 shadow-sm border border-slate-200 text-slate-400 group-hover:text-purple-600 transition-colors">
+                             {showEquation ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                          </div>
+                        </button>
+                      </div>
+                      
+                      {showEquation && (
+                        <div className="mt-3 mb-4 text-[11px] bg-slate-100 border border-slate-200 rounded-lg p-3 text-slate-800 overflow-x-auto">
+                          <pre className="whitespace-pre-wrap break-all text-[10px] font-mono leading-relaxed">{equationText}</pre>
+                        </div>
+                      )}
+
+                      <div className="mt-4 border-t border-slate-100 pt-4">
+                        <div className="font-semibold text-slate-900 mb-2 flex items-center gap-2">
+                            <Clock className="w-4 h-4 text-purple-600"/>
+                            Filtered Combination Statistics
+                        </div>
+                        {isOverProcessingLimit ? (
+                            <div className="text-center text-slate-500 text-xs py-4">
+                                Statistics disabled. Increase processing limit or select more factors.
+                            </div>
+                        ) : (
+                            <div className="grid grid-cols-3 gap-y-2 gap-x-4 text-center">
+                                <div className="col-span-1 border border-slate-200 rounded-lg p-2">
+                                    <TrendingDown className="w-4 h-4 mx-auto text-green-600"/>
+                                    <div className="text-[10px] text-slate-500 uppercase">Min</div>
+                                    <div className="text-sm font-bold text-green-700">{scoreStats.min.toFixed(2)}</div>
+                                </div>
+                                <div className="col-span-1 border border-slate-200 rounded-lg p-2">
+                                    <TrendingUp className="w-4 h-4 mx-auto text-red-600"/>
+                                    <div className="text-[10px] text-slate-500 uppercase">Max</div>
+                                    <div className="text-sm font-bold text-red-700">{scoreStats.max.toFixed(2)}</div>
+                                </div>
+                                <div className="col-span-1 border border-slate-200 rounded-lg p-2">
+                                    <BarChart3 className="w-4 h-4 mx-auto text-blue-600"/>
+                                    <div className="text-[10px] text-slate-500 uppercase">Avg</div>
+                                    <div className="text-sm font-bold text-blue-700">{scoreStats.avg.toFixed(2)}</div>
+                                </div>
+                                <div className="col-span-3 border-t border-slate-100 mt-2 pt-2 text-xs text-slate-500 text-right">
+                                    Total combinations evaluated: 
+                                    <button onClick={scrollToTable} className="font-semibold text-purple-600 hover:underline ml-1">
+                                        {scoreStats.count.toLocaleString()}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                      </div>
+
+                      {/* Limits Controls (Collapsed) */}
+                      <div className="mt-6 border-t border-slate-100 pt-4">
+                         <button 
+                            onClick={() => setShowLimits(!showLimits)}
+                            className="flex items-center gap-2 text-slate-500 hover:text-slate-700 transition text-sm mb-3 w-full justify-between group"
+                         >
+                            <div className="flex items-center gap-2 font-normal">
+                                <Wrench className="w-4 h-4 text-slate-400 group-hover:text-slate-600" />
+                                <span>limits controls</span>
+                            </div>
+                            {showLimits ? <ChevronUp className="w-3 h-3"/> : <ChevronDown className="w-3 h-3"/>}
+                         </button>
+                         
+                         {showLimits && (
+                           <div className="flex flex-col gap-3 pl-2 border-l-2 border-slate-100 animate-in fade-in slide-in-from-top-1 duration-200">
+                                <div className="flex flex-col">
+                                    <label htmlFor="limit-input" className="text-xs font-semibold text-slate-600 mb-1">Max Processing Limit</label>
+                                    <input
+                                        id="limit-input"
+                                        type="number"
+                                        min="1"
+                                        step="1000"
+                                        value={combinationThreshold}
+                                        onChange={handleThresholdChange}
+                                        className="w-full text-center text-sm font-bold text-purple-700 border border-slate-300 rounded-lg p-2 focus:ring-2 focus:ring-purple-500 transition"
+                                    />
+                                </div>
+                                <div className="flex flex-col">
+                                    <label htmlFor="table-limit-input" className="text-xs font-semibold text-slate-600 mb-1">Table Rows Cap</label>
+                                    <input
+                                        id="table-limit-input"
+                                        type="number"
+                                        min="100"
+                                        step="100"
+                                        value={tableDisplayLimit}
+                                        onChange={handleTableLimitChange}
+                                        className="w-full text-center text-sm font-bold text-purple-700 border border-slate-300 rounded-lg p-2 focus:ring-2 focus:ring-purple-500 transition"
+                                    />
+                                </div>
+                           </div>
+                         )}
+                      </div>
+
+                    </div>
+                  </div>
+                </div>
+                
+                {/* COMBINATIONS TABLE */}
+                <div className="pt-8">
+                    <CombinationsTable 
+                        totalPotentialCount={totalPotentialCountUnfiltered}
+                        filteredCombinations={filteredScoredCombinations} 
+                        factorNames={factorNames}
+                        selected={selected} 
+                        tableRef={tableRef}
+                        isTooLarge={isTooLarge}
+                        displayLimit={tableDisplayLimit} // Use dynamic limit
+                        filteredTotalCount={totalPotentialCountFiltered} // Pass the actual count of matches
+                        scoreFilter={scoreFilter}
+                    />
+                </div>
+                
+              </div>
+            </div>
+          );
+        }
+
+        const root = createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
